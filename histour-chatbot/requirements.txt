@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+openai==0.28
+faiss-cpu
+sentence-transformers
+psycopg2-binary
+python-dotenv
+pandas
