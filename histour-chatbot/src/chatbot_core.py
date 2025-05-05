@@ -2,14 +2,14 @@ import json
 import faiss
 import pandas as pd
 from sentence_transformers import SentenceTransformer
-import openai
+from openai import OpenAI
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # 🔐 OpenAI API 키
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 📄 데이터 로딩
 df = pd.read_csv("https://raw.githubusercontent.com/HisTour-capstone04/HisTour-AI/main/HisTour/heritage/korea_heritage.csv")
@@ -97,9 +97,12 @@ def ask_with_rag(question, top_k=3):
     }
 
     local_messages = messages + [context_message, {"role": "user", "content": question}]
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4-1106-preview",
+    
+    response = client.chat.completions.create(
+        #model="gpt-4-1106-preview",
+        #gpt-4 보다는 3.5가 응답속도가 빠르다고 해서 수정
+        #돌려가면서 테스트하셈
+        model="gpt-3.5-turbo",
         messages=local_messages,
         temperature=0.7
     )
@@ -144,7 +147,7 @@ def ask_heritage_chatbot(question):
         [답변]
         """
         messages.append({"role": "user", "content": prompt})
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-4-1106-preview",
             messages=messages,
             temperature=0.7
