@@ -3,12 +3,13 @@ from __future__ import annotations
 import os
 import json
 from datetime import datetime
+import time
 
 import faiss
 import pandas as pd
 from math import radians, sin, cos, sqrt, atan2
 from sentence_transformers import SentenceTransformer
-import openai
+from openai import OpenAI
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -16,12 +17,12 @@ from db import save_chat_to_db
 from typing import Optional
 from difflib import SequenceMatcher
 
-# 환경변수 로드
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
 # FastAPI 앱 초기화
 app = FastAPI()
+
+# 환경변수 로드
+load_dotenv()
+client = OpenAI(api_key = os.getenv("OPENAI_API_KEY"))
 
 # 📄 CSV 데이터 로딩 (위치·설명 등) citeturn6file0
 df = pd.read_csv(
@@ -44,7 +45,7 @@ pending_choices = None
 # 🚩 Pydantic 요청 모델
 tmp = (0.0, 0.0)
 class ChatRequest(BaseModel):
-    user_id: str
+    user_id: int
     question: str
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -185,8 +186,8 @@ def find_best_matching_title(df, question: str):
         return None
 
 # 💬 GPT-direct (프롬프트 엔지니어링)
-def ask_gpt_direct(question: str):
-    resp = openai.ChatCompletion.create(
+def ask_gpt_direct(question: str) -> str:
+    resp = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[{"role":"system","content":"너는 한국 문화유산 전문 챗봇이야."},
                   {"role":"user","content":question}],
@@ -268,7 +269,7 @@ def ask_with_rag(
 """
 
     try:
-        r = openai.ChatCompletion.create(
+        r = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role":"user","content":prompt}],
             temperature=0.7
@@ -278,7 +279,7 @@ def ask_with_rag(
         return ask_gpt_direct(question)
 
 # 🔑 챗봇 핵심 로직
-def ask_heritage_chatbot(question: str, user_id: str, user_gps: tuple) -> str:
+def ask_heritage_chatbot(question: str, user_id: int, user_gps: tuple) -> str:
     global messages, last_mentioned_title, pending_choices
 
     # 사용자 메시지 히스토리에 추가
@@ -335,6 +336,7 @@ async def chat(req: ChatRequest):
     else:
         user_gps = None
 
+    start = time.time()
     answer = ask_heritage_chatbot(
         question=req.question,
         user_id=req.user_id,
@@ -342,8 +344,8 @@ async def chat(req: ChatRequest):
     )
     messages.append({"role": "assistant", "content": answer})
     print(messages)
-    save_chat_to_db(req.user_id, req.question, answer)
     print("답변 생성 : ", datetime.now().second, datetime.now().microsecond)
-    return {"answer": answer}
+    print("실행시간: ", time.time() - start)
+    return answer
 # latitude가 위도, longitude가 경도 -> 근데 데이터는 반대로 되어 있음.... 그래서 억지로 수정
 # uvicorn test_main:app --reload
