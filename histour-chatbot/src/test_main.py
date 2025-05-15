@@ -6,8 +6,6 @@ from datetime import datetime
 
 import faiss
 import pandas as pd
-import numpy as np
-import psycopg2
 from math import radians, sin, cos, sqrt, atan2
 from sentence_transformers import SentenceTransformer
 import openai
@@ -16,8 +14,6 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from db import save_chat_to_db
 from typing import Optional
-import re
-import time
 from difflib import SequenceMatcher
 
 # 환경변수 로드
@@ -40,8 +36,8 @@ with open("heritage_docs.json", "r", encoding="utf-8") as f:
     documents = json.load(f)
 
 # 대화 메모리
-messages = [{"role": "system", "content": "너는 한국 문화유산 전문 챗봇이야."}]
-MAX_TURNS = 6
+messages = [{"role": "system", "content": "너는 한국 문화유산 전문 챗봇이야. 사용자의 질문에 성실히 답변하세요."}]
+MAX_TURNS = 4
 last_mentioned_title = None
 pending_choices = None
 
@@ -176,13 +172,17 @@ def find_best_matching_title(df, question: str):
     for i in scored:
         print(i, df.loc[i[4]]["문화재명"])
     # ➍ 최상위 후보 선택
-    _, _, _, _, best_idx = scored[0]
+    _, _, best_sim, _, best_idx = scored[0]
     r = df.loc[best_idx]
-    return {
-        "title":       r["문화재명"],
-        "description": r.get("상세설명", "").strip(),
-        "location":    (r.get("상세주소","") or r.get("소재지","")).strip(),
-    }
+    if best_sim>0.25:
+        return {
+            "title":       r["문화재명"],
+            "sim": best_sim,
+            "description": r.get("상세설명", "").strip(),
+            "location":    (r.get("상세주소","") or r.get("소재지","")).strip(),
+        }
+    else:
+        return None
 
 # 💬 GPT-direct (프롬프트 엔지니어링)
 def ask_gpt_direct(question: str):
@@ -195,22 +195,78 @@ def ask_gpt_direct(question: str):
     return resp.choices[0].message.content.strip()
 
 # 🤖 RAG → GPT-direct
-def ask_with_rag(question: str, top_k: int = 3):
+# def ask_with_rag(question: str, top_k: int = 3):
+#     qv = model.encode([question])
+#     D,I = index.search(qv, k=top_k)
+#     docs = [documents[i] for i in I[0] if documents[i].strip()]
+#     if not docs:
+#         return ask_gpt_direct(question)
+#     ctx = "\n---\n".join(docs)
+#     prompt = f"""
+# 아래 문서를 참고해 정확하고 친절하게 답변해줘. 문서에 없으면 '자료가 없습니다.'라고 응답해줘.
+#
+# [문서]
+# {ctx}
+#
+# [질문]
+# {question}
+# [답변]"""
+#     try:
+#         r = openai.ChatCompletion.create(
+#             model="gpt-3.5-turbo",
+#             messages=[{"role":"user","content":prompt}],
+#             temperature=0.7
+#         )
+#         return r.choices[0].message.content.strip()
+#     except:
+#         return ask_gpt_direct(question)
+
+def ask_with_rag(
+    question: str,
+    top_k: int = 3,
+    matches: list[dict] | None = None  # 새로 추가된 인자: [{ "title":..., "score":... }, …]
+):
+    # ① RAG 검색 (벡터 유사도 top_k)
     qv = model.encode([question])
-    D,I = index.search(qv, k=top_k)
+    D, I = index.search(qv, k=top_k)
+    # ② 실제 본문 추출
     docs = [documents[i] for i in I[0] if documents[i].strip()]
+
+    # ③ match 메타정보가 없으면, I와 docs로 간단하게 뽑아내도 됩니다
+    #    matches = matches or [{"idx":int(i), "title":titles[i], "dist":float(d)}
+    #                         for d,i in zip(D[0], I[0])]
+
     if not docs:
         return ask_gpt_direct(question)
+
+    # ④ match 정보(제목·유사도 등)를 프롬프트에 정리
+    match_ctx = ""
+    if matches:
+        lines = []
+        for m in matches:
+            # 예: m = {"title":"경주 불국사","sim":0.44}
+            title = m.get("title", "unknown")
+            sim   = m.get("sim", "")
+            lines.append(f"- {title} (sim: {sim})")
+        match_ctx = "\n[매칭된 타이틀]\n" + "\n".join(lines)
+
+    # ⑤ 문서 컨텍스트
     ctx = "\n---\n".join(docs)
+
+    # ⑥ 프롬프트 생성 시 match_ctx 삽입
     prompt = f"""
-아래 문서를 참고해 정확하고 친절하게 답변해줘. 문서에 없으면 '자료가 없습니다.'라고 응답해줘.
+아래 문서를 참고해 정확하고 친절하게 답변해줘.
+문서에 없으면 '자료가 없습니다.'라고 응답해줘.
+{match_ctx}
 
 [문서]
 {ctx}
 
 [질문]
 {question}
-[답변]"""
+[답변]
+"""
+
     try:
         r = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
@@ -218,15 +274,23 @@ def ask_with_rag(question: str, top_k: int = 3):
             temperature=0.7
         )
         return r.choices[0].message.content.strip()
-    except:
+    except Exception:
         return ask_gpt_direct(question)
 
 # 🔑 챗봇 핵심 로직
 def ask_heritage_chatbot(question: str, user_id: str, user_gps: tuple) -> str:
     global messages, last_mentioned_title, pending_choices
+
+    # 사용자 메시지 히스토리에 추가
+    messages.append({"role": "user", "content": question})
+
+    # 너무 긴 대화는 최근 MAX_TURNS*2 + 시스템 메시지만 유지
+    if len(messages) > MAX_TURNS * 2 + 1:
+        messages = [messages[0]] + messages[-(MAX_TURNS * 2):]
+    print(len(messages))
+
     # 1) 지시어 처리
-    pronouns = ["것", "곳", "그 곳", "이 곳", "여기는", "그건", "그것은", "여긴", "이건", "그 곳은", "거기", "여기"
-        , "이 곳은", "이곳은", "그곳은", "그것의", "이것의", "그 것의", "이 것의", "걔", "얘", "방금 거", "방금", "아까"]
+    pronouns = ["것", "곳", "건", "거기", "여기", "걔", "얘", "방금", "아까", "거긴", "여긴"]
     if any(p in question for p in pronouns) and last_mentioned_title:
         for p in pronouns:
             if p in question:
@@ -234,16 +298,8 @@ def ask_heritage_chatbot(question: str, user_id: str, user_gps: tuple) -> str:
     # 2) GPS 기반 필터링
     # 사용자 위치 기반 필터링
     print("근처 유적지 찾기 시작 : ", datetime.now().second, datetime.now().microsecond)
-    if user_gps:
-        sub_df = filter_by_distance(df, user_gps)
-    else:
-        sub_df = df
-
-    # sub_df가 완전히 비어 있으면 원본 df 사용
-    if sub_df.empty:
-        sub_df = df
+    sub_df = filter_by_distance(df, user_gps)
     print("그 중에서 매칭 시작 : ", datetime.now().second, datetime.now().microsecond)
-
     # 3) 위치 전용
     if is_location_only_question(question):
         loc = get_location_only(sub_df, question)
@@ -252,13 +308,16 @@ def ask_heritage_chatbot(question: str, user_id: str, user_gps: tuple) -> str:
 
     # 4) 정확 매칭
     match = find_best_matching_title(sub_df, question)
+    if match is None:
+        print("거리가 너무 멀어서 전체 데이터에서 찾아보겠음~")
+        match = find_best_matching_title(df, question)
     print(match)
     if match:
         print("match")
         last_mentioned_title = match['title']
         # RAG로도 문서+DB 통합 검색 실행 (토큰 절감 위해 DB 검색 코드 생략)
         print("매칭 후 답변 생성 시작 : ", datetime.now().second, datetime.now().microsecond)
-        return ask_with_rag(question)
+        return ask_with_rag(question, matches=[match])
     # 5) 매칭 없음 → GPT-direct + 저장
     print("non match")
     ans = ask_gpt_direct(question)
@@ -281,10 +340,10 @@ async def chat(req: ChatRequest):
         user_id=req.user_id,
         user_gps=user_gps   # 이제 기본값(None) 허용되도록 수정해 두셨죠?
     )
+    messages.append({"role": "assistant", "content": answer})
+    print(messages)
     save_chat_to_db(req.user_id, req.question, answer)
     print("답변 생성 : ", datetime.now().second, datetime.now().microsecond)
     return {"answer": answer}
-
-
-# latitude가 위도, longitude가 경도 -> 근데 데이터는 반대로 되어 있음....
+# latitude가 위도, longitude가 경도 -> 근데 데이터는 반대로 되어 있음.... 그래서 억지로 수정
 # uvicorn test_main:app --reload
